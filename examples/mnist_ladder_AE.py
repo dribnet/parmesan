@@ -153,7 +153,21 @@ def create_decoder(z_hat_in, z_noise, num_units, norm_list, layer_num):
                        W=init, nonlinearity=identity)
     normalize = NormalizeLayer(dense, name='dec_normalize%i' % i)
     u = ScaleAndShiftLayer(normalize, name='dec_scale%i' % i)
-    z_hat = DenoiseLayer(u_net=u, z_net=get_unlab(z_noise), name='dec_denoise%i' % i)
+    z_noise = get_unlab(z_noise)
+    h = 16
+    w = u.output_shape[1] / h
+    u = ReshapeLayer(u, ([0], 1, h, w))
+    z = ReshapeLayer(z_noise, ([0], 1, h, w))
+    uz = ElemwiseMergeLayer([u, z], merge_function=T.mul)
+    uzuz = ConcatLayer([u, z, uz], axis=1)
+
+    conv1 = Conv2DLayer(uzuz, filter_size=1, )
+
+
+    #z_hat = DenoiseLayer(u_net=u, z_net=, name='dec_denoise%i' % i)
+
+
+
     mean = ListIndexLayer(norm_list, index=1, name='dec_index_mean%i' % i)
     var = ListIndexLayer(norm_list, index=2, name='dec_index_var%i' % i)
     z_hat_bn = DecoderNormalizeLayer(z_hat, mean=mean, var=var,
@@ -162,28 +176,28 @@ def create_decoder(z_hat_in, z_noise, num_units, norm_list, layer_num):
 
 
 h1, z1, z_noise1, norm_list1 = create_encoder(
-    h0, num_units=1000, nonlinearity=unit, layer_num=1)
+    h0, num_units=1024, nonlinearity=unit, layer_num=1)
 
 h2, z2, z_noise2, norm_list2 = create_encoder(
-    h1, num_units=500, nonlinearity=unit, layer_num=2)
+    h1, num_units=512, nonlinearity=unit, layer_num=2)
 
 h3, z3, z_noise3, norm_list3 = create_encoder(
-    h2, num_units=250, nonlinearity=unit, layer_num=3)
+    h2, num_units=256, nonlinearity=unit, layer_num=3)
 
 h4, z4, z_noise4, norm_list4 = create_encoder(
-    h3, num_units=250, nonlinearity=unit, layer_num=4)
+    h3, num_units=256, nonlinearity=unit, layer_num=4)
 
 h5, z5, z_noise5, norm_list5 = create_encoder(
-    h4, num_units=250, nonlinearity=unit, layer_num=5)
+    h4, num_units=256, nonlinearity=unit, layer_num=5)
 
 h6, z6, z_noise6, norm_list6 = create_encoder(
     h4, num_units=10, nonlinearity=softmax, layer_num=6)
 
 l_out_enc = h6
 
-print "h6:", lasagne.layers.get_output(h6, sym_x).eval({sym_x: x_train[:200]}).shape
+#print "h6:", lasagne.layers.get_output(h6, sym_x).eval({sym_x: x_train[:200]}).shape
 h6_dec = get_unlab(l_out_enc)
-print "y_weights_decoder:", lasagne.layers.get_output(h6_dec, sym_x).eval({sym_x: x_train[:200]}).shape
+#print "y_weights_decoder:", lasagne.layers.get_output(h6_dec, sym_x).eval({sym_x: x_train[:200]}).shape
 
 # note that the DenoiseLayer takes a z_indices argument which slices
 # the lateral connection from the encoder. For the fully supervised case
@@ -201,11 +215,11 @@ z_hat_bn6 = DecoderNormalizeLayer(
 ###########################
 
 
-z_hat5, z_hat_bn5 = create_decoder(z_hat6, z_noise5, 250, norm_list5, 5)
-z_hat4, z_hat_bn4 = create_decoder(z_hat5, z_noise4, 250, norm_list4, 4)
-z_hat3, z_hat_bn3 = create_decoder(z_hat4, z_noise3, 250, norm_list3, 3)
-z_hat2, z_hat_bn2 = create_decoder(z_hat3, z_noise2, 500, norm_list2, 2)
-z_hat1, z_hat_bn1 = create_decoder(z_hat2, z_noise1, 1000, norm_list1, 1)
+z_hat5, z_hat_bn5 = create_decoder(z_hat6, z_noise5, 256, norm_list5, 5)
+z_hat4, z_hat_bn4 = create_decoder(z_hat5, z_noise4, 256, norm_list4, 4)
+z_hat3, z_hat_bn3 = create_decoder(z_hat4, z_noise3, 256, norm_list3, 3)
+z_hat2, z_hat_bn2 = create_decoder(z_hat3, z_noise2, 512, norm_list2, 2)
+z_hat1, z_hat_bn1 = create_decoder(z_hat2, z_noise1, 1024, norm_list1, 1)
 
 
 ############################# Decoder Layer 0

@@ -11,6 +11,82 @@ import os
 import uuid
 import parmesan
 
+class Unpooling2D(lasagne.layers.Layer):
+    def __init__(self, incoming, factor=2, ignore_border=True, **kwargs):
+        super(Unpooling2D, self).__init__(incoming, **kwargs)
+        if isinstance(factor, int):
+            factor = (factor, factor)
+
+        self.pool_size = factor
+        self.ignore_border = ignore_border
+
+    def get_output_for(self, input, **kwargs):
+        s1 = self.pool_size[0]
+        s2 = self.pool_size[1]
+        output = input.repeat(s1, axis=2).repeat(s2, axis=3)
+        return output
+
+    def get_output_shape_for(self, input_shape):
+        shp = list(input_shape)
+        shp = shp[:2] + [shp[2]*self.pool_size[0], shp[3]*self.pool_size[1]]
+        return tuple(shp)
+
+
+class Unpooling2D(lasagne.layers.Layer):
+    def __init__(self, incoming, pool_size=(2, 2), ignore_border=True, **kwargs):
+        super(Unpooling2D, self).__init__(incoming, **kwargs)
+        self.pool_size = pool_size
+        self.ignore_border = ignore_border
+
+    def get_output_for(self, input, **kwargs):
+        s1 = self.pool_size[0]
+        s2 = self.pool_size[1]
+        output = input.repeat(s1, axis=2).repeat(s2, axis=3)
+        return output
+
+    def get_output_shape_for(self, input_shape):
+        shp = list(input_shape)
+        shp = shp[:2] + [shp[2]*self.pool_size[0], shp[3]*self.pool_size[1]]
+        return tuple(shp)
+
+
+class Depooling(lasagne.layers.Layer):
+    """
+    code from
+    https://gist.github.com/kastnerkyle/f3f67424adda343fef40
+
+    """
+    def __init__(self, incoming, factor, ignore_border=True, **kwargs):
+        super(Depooling, self).__init__(incoming, **kwargs)
+        self.factor = factor
+        self.ignore_border = ignore_border
+
+    def get_output_for(self, input, **kwargs):
+        stride = input.shape[2]
+        offset = input.shape[3]
+        in_dim = stride * offset
+        out_dim = in_dim * self.factor * self.factor
+
+        upsamp_matrix = T.zeros((in_dim, out_dim))
+        rows = T.arange(in_dim)
+        cols = rows*self.factor + (rows/stride * self.factor * offset)
+        upsamp_matrix = T.set_subtensor(upsamp_matrix[rows, cols], 1.)
+        flat = T.reshape(
+            input,
+            (input.shape[0], self.output_shape[1],
+             input.shape[2] * input.shape[3]))
+
+        up_flat = T.dot(flat, upsamp_matrix)
+        upsamp = T.reshape(up_flat, (input.shape[0], self.output_shape[1],
+                                     self.output_shape[2], self.output_shape[3]))
+
+        return upsamp
+
+    def get_output_shape_for(self, input_shape):
+        shp = list(input_shape)
+        shp = shp[:2] + [shp[2]*self.factor, shp[3]*self.factor]
+        return tuple(shp)
+
 
 class MyInit(lasagne.init.Initializer):
     """Sample initial weights from the Gaussian distribution.
@@ -49,7 +125,7 @@ num_classes = 10
 batch_size = 100  # fails if batch_size != batch_size
 num_labels = 100
 
-output_folder = "logs/mnist_ladder" + str(uuid.uuid4())[:18].replace('-', '_')
+output_folder = "logs/mnist_ladder_conv" + str(uuid.uuid4())[:18].replace('-', '_')
 if not os.path.exists(output_folder):
     os.makedirs(output_folder)
 output_file = os.path.join(output_folder, 'results.log')
@@ -114,6 +190,7 @@ print "Lambdas: ", lambdas
 num_classes = 10
 num_inputs = 784
 lr = float(args.lr)
+h,w, c = 28, 28, 1
 noise = 0.3
 num_epochs = 300
 start_decay = 50
@@ -122,6 +199,7 @@ sym_t = T.ivector('sym_t')
 sh_lr = theano.shared(lasagne.utils.floatX(lr))
 
 z_pre0 = InputLayer(shape=(None, x_train.shape[1]))
+z_pre0 = ReshapeLayer(z_pre0, ([0], c, h, w))
 z0 = z_pre0   # for consistency with other layers
 z_noise0 = GaussianNoiseLayer(z0, sigma=noise, name='enc_noise0')
 h0 = z_noise0  # no nonlinearity on input
@@ -131,7 +209,25 @@ def get_unlab(l):
     return SliceLayer(l, indices=slice(num_labels, None), axis=0)
 
 
-def create_encoder(incoming, num_units, nonlinearity, layer_num):
+def create_encoder_conv(incoming, num_filters, nonlinearity, layer_num, maxpool=False):
+    i = layer_num
+    if maxpool:
+        incoming = MaxPool2DLayer(incoming, pool_size=2)
+    z_pre = Conv2DLayer(
+        incoming=incoming, nonlinearity=identity, b=None,
+        name='enc_dense%i' % i, W=init, num_filters=num_filters, filter_size=3, pad=1)
+    norm_list = NormalizeLayer(
+        z_pre, return_stats=True, name='enc_normalize%i' % i,
+        stat_indices=unlabeled_slice)
+    z = ListIndexLayer(norm_list, index=0, name='enc_index%i' % i)
+    z_noise = GaussianNoiseLayer(z, sigma=noise, name='enc_noise%i' % i)
+    h = NonlinearityLayer(
+        ScaleAndShiftLayer(z_noise, name='enc_scale%i' % i),
+        nonlinearity=nonlinearity, name='enc_nonlin%i' % i)
+    return h, z, z_noise, norm_list
+
+
+def create_encoder_dense(incoming, num_units, nonlinearity, layer_num):
     i = layer_num
     z_pre = DenseLayer(
         incoming=incoming, num_units=num_units, nonlinearity=identity, b=None,
@@ -147,13 +243,54 @@ def create_encoder(incoming, num_units, nonlinearity, layer_num):
     return h, z, z_noise, norm_list
 
 
-def create_decoder(z_hat_in, z_noise, num_units, norm_list, layer_num):
+def denoise_conv(u, z, name):
+    num_filters, height, width = z.output_shape[1:]
+    uz = ConcatLayer([u, z], axis=1, name=name)
+    conv_lin = Conv2DLayer(uz, nonlinearity=identity, num_filters=num_filters,
+                           filter_size=3, pad=1, name=name+ "_lin")
+    conv_nonlin = Conv2DLayer(uz, nonlinearity=lasagne.nonlinearities.sigmoid,
+                              num_filters=num_filters, filter_size=3, pad=1, name=name+"_nonlin")
+    denoise = ElemwiseSumLayer([conv_lin, conv_nonlin], name=name+"_sum")
+    return denoise
+
+
+def create_decoder_dense(z_hat_in, z_noise, norm_list, layer_num):
     i = layer_num
+    num_units = np.prod(z_noise.output_shape[1:])
     dense = DenseLayer(z_hat_in, num_units=num_units, name='dec_dense%i' % i,
                        W=init, nonlinearity=identity)
-    normalize = NormalizeLayer(dense, name='dec_normalize%i' % i)
+    num_filters, height, width = z_noise.output_shape[1:]
+    conv = ReshapeLayer(dense, (-1, num_filters, height, width))
+
+    normalize = NormalizeLayer(conv, name='dec_normalize%i' % i)
     u = ScaleAndShiftLayer(normalize, name='dec_scale%i' % i)
-    z_hat = DenoiseLayer(u_net=u, z_net=get_unlab(z_noise), name='dec_denoise%i' % i)
+    lateral = get_unlab(z_noise)
+
+    z_hat = denoise_conv(u, lateral, name='dec_denoise%i' % i)
+    print "z_hat%i:"%i, lasagne.layers.get_output(z_hat, sym_x).eval({sym_x: x_train[:200]}).shape
+    mean = ListIndexLayer(norm_list, index=1, name='dec_index_mean%i' % i)
+    var = ListIndexLayer(norm_list, index=2, name='dec_index_var%i' % i)
+    z_hat_bn = DecoderNormalizeLayer(z_hat, mean=mean, var=var,
+                                     name='dec_decnormalize%i' % i)
+    return z_hat, z_hat_bn
+
+def create_decoder_conv(z_hat_in, z_noise, norm_list, layer_num):
+    i = layer_num
+    num_filters, height, width = z_hat_in.output_shape[1:]
+    if z_hat_in.output_shape[2] != z_noise.output_shape[2]:  # if heights are not identical depool
+        z_hat_in = Depooling(z_hat_in)
+        assert z_hat_in.output_shape[2] == z_noise.output_shape[2], "heights are not identical after deppoling, " \
+                                                                    "something whent wrong...."
+
+    conv = Conv2DLayer(z_hat_in, num_filters=num_filters,
+                        filter_size=3, pad=1, name='dec_dense%i' % i,
+                       W=init, nonlinearity=identity)
+    normalize = NormalizeLayer(conv, name='dec_normalize%i' % i)
+    u = ScaleAndShiftLayer(normalize, name='dec_scale%i' % i)
+    lateral = get_unlab(z_noise)
+
+    z_hat = denoise_conv(u, lateral, name='dec_denoise%i' % i)
+    print "z_hat%i:"%i, lasagne.layers.get_output(z_hat, sym_x).eval({sym_x: x_train[:200]}).shape
     mean = ListIndexLayer(norm_list, index=1, name='dec_index_mean%i' % i)
     var = ListIndexLayer(norm_list, index=2, name='dec_index_var%i' % i)
     z_hat_bn = DecoderNormalizeLayer(z_hat, mean=mean, var=var,
@@ -161,22 +298,23 @@ def create_decoder(z_hat_in, z_noise, num_units, norm_list, layer_num):
     return z_hat, z_hat_bn
 
 
-h1, z1, z_noise1, norm_list1 = create_encoder(
-    h0, num_units=1000, nonlinearity=unit, layer_num=1)
 
-h2, z2, z_noise2, norm_list2 = create_encoder(
-    h1, num_units=500, nonlinearity=unit, layer_num=2)
+h1, z1, z_noise1, norm_list1 = create_encoder_conv(
+    h0, num_filters=32, nonlinearity=unit, layer_num=1, maxpool=False)
 
-h3, z3, z_noise3, norm_list3 = create_encoder(
-    h2, num_units=250, nonlinearity=unit, layer_num=3)
+h2, z2, z_noise2, norm_list2 = create_encoder_conv(
+    h1, num_filters=64, nonlinearity=unit, layer_num=2, maxpool=True)
 
-h4, z4, z_noise4, norm_list4 = create_encoder(
-    h3, num_units=250, nonlinearity=unit, layer_num=4)
+h3, z3, z_noise3, norm_list3 = create_encoder_conv(
+    h2, num_filters=64, nonlinearity=unit, layer_num=3, maxpool=False)
 
-h5, z5, z_noise5, norm_list5 = create_encoder(
-    h4, num_units=250, nonlinearity=unit, layer_num=5)
+h4, z4, z_noise4, norm_list4 = create_encoder_conv(
+    h3, num_filters=96, nonlinearity=unit, layer_num=4, maxpool=True)
 
-h6, z6, z_noise6, norm_list6 = create_encoder(
+h5, z5, z_noise5, norm_list5 = create_encoder_conv(
+    h4, num_filters=96, nonlinearity=unit, layer_num=5, maxpool=False)
+
+h6, z6, z_noise6, norm_list6 = create_encoder_dense(
     h4, num_units=10, nonlinearity=softmax, layer_num=6)
 
 l_out_enc = h6
@@ -199,22 +337,25 @@ var6 = ListIndexLayer(norm_list6, index=2, name='dec_index_var6')
 z_hat_bn6 = DecoderNormalizeLayer(
     z_hat6, mean=mean6, var=var6, name='dec_decnormalize6')
 ###########################
+print "z_hat_bn6:", lasagne.layers.get_output(z_hat_bn6, sym_x).eval({sym_x: x_train[:200]}).shape
 
-
-z_hat5, z_hat_bn5 = create_decoder(z_hat6, z_noise5, 250, norm_list5, 5)
-z_hat4, z_hat_bn4 = create_decoder(z_hat5, z_noise4, 250, norm_list4, 4)
-z_hat3, z_hat_bn3 = create_decoder(z_hat4, z_noise3, 250, norm_list3, 3)
-z_hat2, z_hat_bn2 = create_decoder(z_hat3, z_noise2, 500, norm_list2, 2)
-z_hat1, z_hat_bn1 = create_decoder(z_hat2, z_noise1, 1000, norm_list1, 1)
+z_hat5, z_hat_bn5 = create_decoder_dense(z_hat6, z_noise5, norm_list5, 5)
+z_hat4, z_hat_bn4 = create_decoder_conv(z_hat5, z_noise4, norm_list4, 4)
+z_hat3, z_hat_bn3 = create_decoder_conv(z_hat4, z_noise3, norm_list3, 3)
+z_hat2, z_hat_bn2 = create_decoder_conv(z_hat3, z_noise2, norm_list2, 2)
+z_hat1, z_hat_bn1 = create_decoder_conv(z_hat2, z_noise1, norm_list1, 1)
 
 
 ############################# Decoder Layer 0
 # i need this because i also has h0 aka. input layer....
-u0 = ScaleAndShiftLayer(  # refactor this...
-    NormalizeLayer(
-        DenseLayer(z_hat1, num_units=num_inputs, name='dec_dense0', W=init, nonlinearity=identity),
-        name='dec_normalize0'), name='dec_scale0')
-z_hat0 = DenoiseLayer(u_net=u0, z_net=get_unlab(z_noise0), name='dec_denoise0')
+# MAYBE CHANGE THIS TO RECURRENT CONV???
+num_channels_input = z_noise0.output_shape[1]
+conv = Conv2DLayer(z_hat1, num_filters=num_channels_input, name='dec_dense0',
+                    W=init, nonlinearity=identity, filter_size=3, pad=1)
+normalize = NormalizeLayer(conv, name='dec_normalize0')
+u0 = ScaleAndShiftLayer(normalize,  name='dec_scale0')
+lateral0 = get_unlab(z_noise0)
+z_hat0 = denoise_conv(u0, lateral0, name='dec_denoise0')
 z_hat_bn0 = z_hat0   # for consistency
 #############################
 
@@ -262,6 +403,9 @@ costs += [lambdas[0]*T.sqr(z0_clean.flatten(2) - z_hat_bn0_noisy.flatten(2)).mea
 
 cost = sum(costs)
 # prediction passes
+
+print "cost:", cost.eval({sym_x: x_train[:200], sym_t: targets_train[:200]})
+
 collect_out = lasagne.layers.get_output(
     l_out_enc, sym_x, deterministic=True, collect=True)
 

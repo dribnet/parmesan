@@ -7,9 +7,13 @@ import theano.tensor as T
 from parmesan.layers import (ListIndexLayer, NormalizeLayer,
                              ScaleAndShiftLayer, DecoderNormalizeLayer,
                              DenoiseLayer,)
+import sys
+sys.setrecursionlimit(10000)
 import os
 import uuid
 import parmesan
+from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
+
 
 
 class MyInit(lasagne.init.Initializer):
@@ -37,6 +41,8 @@ import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument("-lambdas", type=str,
                     default='1000,10,0.1,0.1,0.1,0.1,0.1')
+parser.add_argument("-vat", type=str,
+                    default='1.0')
 parser.add_argument("-lr", type=str, default='0.001')
 parser.add_argument("-optimizer", type=str, default='adam')
 parser.add_argument("-init", type=str, default='None')
@@ -48,8 +54,9 @@ args = parser.parse_args()
 num_classes = 10
 batch_size = 100  # fails if batch_size != batch_size
 num_labels = 100
+vat = float(args.vat)
 
-output_folder = "logs/mnist_ladder" + str(uuid.uuid4())[:18].replace('-', '_')
+output_folder = "logs/VAT" + str(uuid.uuid4())[:18].replace('-', '_')
 if not os.path.exists(output_folder):
     os.makedirs(output_folder)
 output_file = os.path.join(output_folder, 'results.log')
@@ -127,6 +134,54 @@ z_noise0 = GaussianNoiseLayer(z0, sigma=noise, name='enc_noise0')
 h0 = z_noise0  # no nonlinearity on input
 
 
+def get_normalized_vector(v):
+    v = v / (1e-6 + T.max(T.abs_(v), axis=1, keepdims=True))
+    v_2 = T.sum(v**2,axis=1,keepdims=True)
+    return v / T.sqrt(1e-6 + v_2)
+
+def get_perturbation(dir, epsilon=0.01, input_size=784, norm_constraint='L2'):
+    if norm_constraint == 'max':
+        print 'perturb:max'
+        return epsilon * T.sgn(dir)
+    if norm_constraint == 'L2':
+        print 'perturb:L2'
+        dir = get_normalized_vector(dir)
+        dir = epsilon * np.float(np.sqrt(input_size)) * dir
+        return dir
+
+
+def reg_vat(unlabeled_p_y_given_x,
+            sym_x,
+            output_layer,
+            num_power_iter=10,
+            xi=np.float(1.0 * 10 ** -6)):
+
+    p = unlabeled_p_y_given_x
+    _srng = RandomStreams(lasagne.random.get_rng().randint(1, 2147462579))
+
+    # d is size of unlabeled input
+    d = _srng.normal(size=(num_labels, num_inputs), dtype=theano.config.floatX)
+    for power_iter in xrange(num_power_iter):
+        d = lasagne.utils.floatX(xi) * get_normalized_vector(d)
+
+        # this is just the output from the network. Get output paa enten y eller x_rec?
+
+        p_d = lasagne.layers.get_output(output_layer, sym_x + d)
+        kl = -T.mean(T.sum(p * T.log(p_d), axis=1))
+        Hd = T.grad(kl, wrt=d) / xi
+        Hd = theano.gradient.disconnected_grad(Hd)
+        d = Hd
+    r_vadv = get_perturbation(d)
+
+    ul_p_y_given_x_vadv = lasagne.layers.get_output(output_layer, sym_x + r_vadv)
+    p_hat = theano.gradient.disconnected_grad(p)
+
+    # this should be added to the cost and multiplied by lambda which defualts to 1.
+    # note that sym_x should be different from the normal symx
+    return -T.mean(T.sum(p_hat * (T.log(ul_p_y_given_x_vadv)), axis=1))
+
+
+
 def get_unlab(l):
     return SliceLayer(l, indices=slice(num_labels, None), axis=0)
 
@@ -159,6 +214,8 @@ def create_decoder(z_hat_in, z_noise, num_units, norm_list, layer_num):
     z_hat_bn = DecoderNormalizeLayer(z_hat, mean=mean, var=var,
                                      name='dec_decnormalize%i' % i)
     return z_hat, z_hat_bn
+
+
 
 
 h1, z1, z_noise1, norm_list1 = create_encoder(
@@ -246,9 +303,18 @@ z6_clean = z6_clean[num_labels:]
 
 
 # if unsupervised we need ot cut ot the samples with no labels.
-out_enc_noisy = out_enc_noisy[:num_labels]
+out_enc_noisy_labeled = out_enc_noisy[:num_labels]
+out_enc_noisy_unlabeled = out_enc_noisy[num_labels:]
 
-costs = [T.mean(T.nnet.categorical_crossentropy(out_enc_noisy, sym_t))]
+
+vat_cost = reg_vat(
+    unlabeled_p_y_given_x=out_enc_noisy_unlabeled,
+    sym_x=sym_x[num_labels:], # slice out unlabeled.
+    output_layer=l_out_enc,
+    num_power_iter=10,
+    xi=np.float(1.0 * 10 ** -6))
+
+costs = [T.mean(T.nnet.categorical_crossentropy(out_enc_noisy_labeled, sym_t))]
 
 # i checkt the blocks code - they do sum over the feature dimension
 costs += [lambdas[6]*T.sqr(z6_clean.flatten(2) - z_hat_bn6_noisy.flatten(2)).mean(axis=1).mean()]
@@ -261,10 +327,16 @@ costs += [lambdas[0]*T.sqr(z0_clean.flatten(2) - z_hat_bn0_noisy.flatten(2)).mea
 
 
 cost = sum(costs)
+
+# add vat cost
+vat_lambda = 1.0
+cost += vat_lambda*vat
 # prediction passes
 collect_out = lasagne.layers.get_output(
     l_out_enc, sym_x, deterministic=True, collect=True)
 
+
+print "cost:", cost.eval({sym_x: x_train[:200], sym_t: targets_train[:100]})
 
 # Get list of all trainable parameters in the network.
 all_params = lasagne.layers.get_all_params(z_hat_bn0, trainable=True)
@@ -284,7 +356,7 @@ updates = optimizer(all_grads, all_params, learning_rate=sh_lr)
 f_clean = theano.function([sym_x], enc_out_clean)
 
 f_train = theano.function([sym_x, sym_t],
-                          [cost, out_enc_noisy] + costs,
+                          [cost, out_enc_noisy_labeled] + costs,
                           updates=updates, on_unused_input='warn')
 
 f_collect = theano.function([sym_x],   # NO UPDATES !!!!!!! FOR COLLECT

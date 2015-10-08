@@ -3,6 +3,7 @@ import theano.tensor as T
 from lasagne.layers import MergeLayer
 from lasagne import init
 from lasagne import nonlinearities
+import theano
 
 
 class DecoderNormalizeLayer(lasagne.layers.MergeLayer):

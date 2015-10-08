@@ -6,10 +6,64 @@ import theano
 import theano.tensor as T
 from parmesan.layers import (ListIndexLayer, NormalizeLayer,
                              ScaleAndShiftLayer, DecoderNormalizeLayer,
-                             DenoiseLayer,)
+                             DenoiseLayer)
 import os
 import uuid
 import parmesan
+
+class RepeatClassLayer(lasagne.layers.Layer):
+    '''
+        Takes a input layer of shape (batch_size, n_features) and repeats the
+        n_features n times such that the output shape is
+        (batch_size, n_repeats, n_featues).
+
+        This can be used for recurrent layers where we want to use the
+        same input for all timesteps e.g. in sutskever models.
+    '''
+    def __init__(self, incomings, n_repeat, **kwargs):
+        super(RepeatClassLayer, self).__init__(incomings, **kwargs)
+
+        self.n_repeat = n_repeat
+
+    def get_output_shape_for(self, input_shape):
+        #
+        if input_shape[0] is None:
+            bs = None
+        else:
+            bs = self.n_repeat*input_shape[0]
+        return (bs, input_shape[1])
+
+    def get_output_for(self, input, *args, **kwargs):
+        assert input.ndim == 2
+        bs, n_classes = input.shape
+        return T.eye(n_classes).dimshuffle('x', 0, 1).repeat(bs, axis=0).reshape((-1, n_classes))
+
+
+class RepeatBatchLayer(lasagne.layers.Layer):
+    '''
+        Takes a input layer of shape (batch_size, n_features) and repeats the
+        n_features n times such that the output shape is
+        (batch_size, n_repeats, n_featues).
+
+        This can be used for recurrent layers where we want to use the
+        same input for all timesteps e.g. in sutskever models.
+    '''
+    def __init__(self, incomings, n_repeat, **kwargs):
+        super(RepeatBatchLayer, self).__init__(incomings, **kwargs)
+
+        self.n_repeat = n_repeat
+
+    def get_output_shape_for(self, input_shape):
+        #
+        if input_shape[0] is None:
+            bs = None
+        else:
+            bs = self.n_repeat*input_shape[0]
+        return (bs, input_shape[1])
+
+    def get_output_for(self, input, *args, **kwargs):
+        bs, nin = input.shape
+        return input.dimshuffle(0, 'x', 1).repeat(self.n_repeat, axis=1).reshape((-1, nin))
 
 
 class MyInit(lasagne.init.Initializer):
@@ -49,7 +103,7 @@ num_classes = 10
 batch_size = 100  # fails if batch_size != batch_size
 num_labels = 100
 
-output_folder = "logs/mnist_ladder" + str(uuid.uuid4())[:18].replace('-', '_')
+output_folder = "logs/RNN_SPN_MULTICROP_RAM_SVHN" + str(uuid.uuid4())[:18].replace('-', '_')
 if not os.path.exists(output_folder):
     os.makedirs(output_folder)
 output_file = os.path.join(output_folder, 'results.log')
@@ -111,6 +165,10 @@ assert len(lambdas) == 7
 print "Lambdas: ", lambdas
 
 
+def create_y(num_classes):
+    return T.transpose(
+        T.eye(num_classes).repeat(num_classes).reshape((num_classes,-1)))
+
 num_classes = 10
 num_inputs = 784
 lr = float(args.lr)
@@ -120,6 +178,7 @@ start_decay = 50
 sym_x = T.matrix('sym_x')
 sym_t = T.ivector('sym_t')
 sh_lr = theano.shared(lasagne.utils.floatX(lr))
+y_dec = create_y(num_classes)
 
 z_pre0 = InputLayer(shape=(None, x_train.shape[1]))
 z0 = z_pre0   # for consistency with other layers
@@ -153,7 +212,7 @@ def create_decoder(z_hat_in, z_noise, num_units, norm_list, layer_num):
                        W=init, nonlinearity=identity)
     normalize = NormalizeLayer(dense, name='dec_normalize%i' % i)
     u = ScaleAndShiftLayer(normalize, name='dec_scale%i' % i)
-    z_hat = DenoiseLayer(u_net=u, z_net=get_unlab(z_noise), name='dec_denoise%i' % i)
+    z_hat = DenoiseLayer(u_net=u, z_net=RepeatBatchLayer(get_unlab(z_noise), num_classes), name='dec_denoise%i' % i)
     mean = ListIndexLayer(norm_list, index=1, name='dec_index_mean%i' % i)
     var = ListIndexLayer(norm_list, index=2, name='dec_index_var%i' % i)
     z_hat_bn = DecoderNormalizeLayer(z_hat, mean=mean, var=var,
@@ -179,27 +238,32 @@ h5, z5, z_noise5, norm_list5 = create_encoder(
 h6, z6, z_noise6, norm_list6 = create_encoder(
     h4, num_units=10, nonlinearity=softmax, layer_num=6)
 
-l_out_enc = h6
+l_y = h6
 
 print "h6:", lasagne.layers.get_output(h6, sym_x).eval({sym_x: x_train[:200]}).shape
-h6_dec = get_unlab(l_out_enc)
-print "y_weights_decoder:", lasagne.layers.get_output(h6_dec, sym_x).eval({sym_x: x_train[:200]}).shape
+y_weights_decoder = get_unlab(l_y)
+print "y_weights_decoder:", lasagne.layers.get_output(y_weights_decoder, sym_x).eval({sym_x: x_train[:200]}).shape
 
 # note that the DenoiseLayer takes a z_indices argument which slices
 # the lateral connection from the encoder. For the fully supervised case
 # the slice is just all labels.
 
+# this is a fucked up layer that will introduce zero gradient!!
+y_dec = RepeatClassLayer(y_weights_decoder, n_repeat=num_classes)
+print "y_dec:", lasagne.layers.get_output(y_dec, sym_x).eval({sym_x: x_train[:200]}).shape
+#print "y_dec:", lasagne.layers.get_output(y_dec, sym_x).eval({sym_x: x_train[:200]})
 
 ##### Decoder Layer 6
 u6 = ScaleAndShiftLayer(NormalizeLayer(
-    h6_dec, name='dec_normalize6'), name='dec_scale6')
-z_hat6 = DenoiseLayer(u_net=u6, z_net=get_unlab(z_noise6), name='dec_denoise6')
+    y_dec, name='dec_normalize6'), name='dec_scale6')
+z_hat6 = DenoiseLayer(u_net=u6, z_net=RepeatBatchLayer(get_unlab(z_noise6), num_classes), name='dec_denoise6')
 mean6 = ListIndexLayer(norm_list6, index=1, name='dec_index_mean6')
 var6 = ListIndexLayer(norm_list6, index=2, name='dec_index_var6')
 z_hat_bn6 = DecoderNormalizeLayer(
     z_hat6, mean=mean6, var=var6, name='dec_decnormalize6')
 ###########################
 
+print "z_hat6:", lasagne.layers.get_output(z_hat6, sym_x).eval({sym_x: x_train[:200]}).shape
 
 z_hat5, z_hat_bn5 = create_decoder(z_hat6, z_noise5, 250, norm_list5, 5)
 z_hat4, z_hat_bn4 = create_decoder(z_hat5, z_noise4, 250, norm_list4, 4)
@@ -214,7 +278,7 @@ u0 = ScaleAndShiftLayer(  # refactor this...
     NormalizeLayer(
         DenseLayer(z_hat1, num_units=num_inputs, name='dec_dense0', W=init, nonlinearity=identity),
         name='dec_normalize0'), name='dec_scale0')
-z_hat0 = DenoiseLayer(u_net=u0, z_net=get_unlab(z_noise0), name='dec_denoise0')
+z_hat0 = DenoiseLayer(u_net=u0, z_net=RepeatBatchLayer(get_unlab(z_noise0), num_classes), name='dec_denoise0')
 z_hat_bn0 = z_hat0   # for consistency
 #############################
 
@@ -223,7 +287,7 @@ print "z_hat_bn0:", lasagne.layers.get_output(
 
 [enc_out_clean, z0_clean, z1_clean, z2_clean,
  z3_clean, z4_clean, z5_clean, z6_clean] = lasagne.layers.get_output(
-    [l_out_enc, z0, z1, z2, z3, z4, z5, z6], sym_x, deterministic=True)
+    [l_y, z0, z1, z2, z3, z4, z5, z6], sym_x, deterministic=True)
 
 # Clean pass of encoder  note that these are both labeled
 # and unlabeled so we need to slice
@@ -237,33 +301,41 @@ z6_clean = z6_clean[num_labels:]
 
 # noisy pass encoder + decoder
 # the output from the decoder is only unlabeled because we slice the top h
-[out_enc_noisy, z_hat_bn0_noisy, z_hat_bn1_noisy,
+[y_out_enc_noisy, z_hat_bn0_noisy, z_hat_bn1_noisy,
  z_hat_bn2_noisy, z_hat_bn3_noisy, z_hat_bn4_noisy,
  z_hat_bn5_noisy, z_hat_bn6_noisy] = lasagne.layers.get_output(
-    [l_out_enc, z_hat_bn0, z_hat_bn1, z_hat_bn2,
+    [l_y, z_hat_bn0, z_hat_bn1, z_hat_bn2,
      z_hat_bn3, z_hat_bn4, z_hat_bn5, z_hat_bn6],
      sym_x,  deterministic=False)
 
 
 # if unsupervised we need ot cut ot the samples with no labels.
-out_enc_noisy = out_enc_noisy[:num_labels]
+y_out_enc_noisy = y_out_enc_noisy[:num_labels]
+y_weights_decoder_out_noisy = y_out_enc_noisy[:num_labels]
 
-costs = [T.mean(T.nnet.categorical_crossentropy(out_enc_noisy, sym_t))]
+costs = [T.mean(T.nnet.categorical_crossentropy(y_out_enc_noisy, sym_t))]
 
 # i checkt the blocks code - they do sum over the feature dimension
-costs += [lambdas[6]*T.sqr(z6_clean.flatten(2) - z_hat_bn6_noisy.flatten(2)).mean(axis=1).mean()]
-costs += [lambdas[5]*T.sqr(z5_clean.flatten(2) - z_hat_bn5_noisy.flatten(2)).mean(axis=1).mean()]
-costs += [lambdas[4]*T.sqr(z4_clean.flatten(2) - z_hat_bn4_noisy.flatten(2)).mean(axis=1).mean()]
-costs += [lambdas[3]*T.sqr(z3_clean.flatten(2) - z_hat_bn3_noisy.flatten(2)).mean(axis=1).mean()]
-costs += [lambdas[2]*T.sqr(z2_clean.flatten(2) - z_hat_bn2_noisy.flatten(2)).mean(axis=1).mean()]
-costs += [lambdas[1]*T.sqr(z1_clean.flatten(2) - z_hat_bn1_noisy.flatten(2)).mean(axis=1).mean()]
-costs += [lambdas[0]*T.sqr(z0_clean.flatten(2) - z_hat_bn0_noisy.flatten(2)).mean(axis=1).mean()]
 
+def ladder_cost(z_clean, z_bn, y):
+    z_clean = z_clean.dimshuffle(0, 'x', 1)
+    z_bn = z_bn.reshape((num_labels, num_classes, -1))
+    x = T.sqr(z_clean - z_bn).mean(axis=2)   # bs x nc
+    return T.mean(x*y)
+
+
+costs += [lambdas[6]*ladder_cost(z6_clean, z_hat_bn6_noisy, y_weights_decoder_out_noisy)]
+costs += [lambdas[5]*ladder_cost(z5_clean, z_hat_bn5_noisy, y_weights_decoder_out_noisy)]
+costs += [lambdas[4]*ladder_cost(z4_clean, z_hat_bn4_noisy, y_weights_decoder_out_noisy)]
+costs += [lambdas[3]*ladder_cost(z3_clean, z_hat_bn3_noisy, y_weights_decoder_out_noisy)]
+costs += [lambdas[2]*ladder_cost(z2_clean, z_hat_bn2_noisy, y_weights_decoder_out_noisy)]
+costs += [lambdas[1]*ladder_cost(z1_clean, z_hat_bn1_noisy, y_weights_decoder_out_noisy)]
+costs += [lambdas[0]*ladder_cost(z0_clean, z_hat_bn0_noisy, y_weights_decoder_out_noisy)]
 
 cost = sum(costs)
 # prediction passes
 collect_out = lasagne.layers.get_output(
-    l_out_enc, sym_x, deterministic=True, collect=True)
+    l_y, sym_x, deterministic=True, collect=True)
 
 
 # Get list of all trainable parameters in the network.
@@ -284,7 +356,7 @@ updates = optimizer(all_grads, all_params, learning_rate=sh_lr)
 f_clean = theano.function([sym_x], enc_out_clean)
 
 f_train = theano.function([sym_x, sym_t],
-                          [cost, out_enc_noisy] + costs,
+                          [cost, y_out_enc_noisy] + costs,
                           updates=updates, on_unused_input='warn')
 
 f_collect = theano.function([sym_x],   # NO UPDATES !!!!!!! FOR COLLECT
@@ -327,6 +399,7 @@ def train_epoch_semisupervised(x):
         losses += [batch_loss]
     return confusion_train, losses, layer_costs
 
+# select correct training function...
 
 def test_epoch(x, y):
     confusion_valid = parmesan.utils.ConfusionMatrix(num_classes)
