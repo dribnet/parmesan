@@ -8,7 +8,7 @@ import theano.tensor as T
 import numpy as np
 import lasagne
 from parmesan.layers import SampleLayer
-from parmesan.datasets import load_mnist_realval
+from kerosene.datasets import binarized_mnist
 import matplotlib.pyplot as plt
 import shutil, gzip, os, cPickle, time, math, operator, argparse
 
@@ -107,17 +107,18 @@ def normal2(x, mean, logvar):
 def standard_normal(x):
     return c - x**2 / 2
 
-def bernoullisample(x):
-    return np.random.binomial(1,x,size=x.shape).astype(theano.config.floatX)
-
 
 ### LOAD DATA AND SET UP SHARED VARIABLES
-train_x, train_t, valid_x, valid_t, test_x, test_t = load_mnist_realval()
-train_x = np.concatenate([train_x,valid_x])
+(train_x,), (test_x,) = binarized_mnist.load_data()
+# data needs to be slightly massaged into the right shape and type
+num_train = len(train_x)
+num_test = len(test_x)
+train_x = train_x.reshape(num_train, 784).astype(theano.config.floatX)
+test_x = test_x.reshape(num_test, 784).astype(theano.config.floatX)
 num_features=train_x.shape[-1]
 
-sh_x_train = theano.shared(np.asarray(bernoullisample(train_x), dtype=theano.config.floatX), borrow=True)
-sh_x_test = theano.shared(np.asarray(bernoullisample(test_x), dtype=theano.config.floatX), borrow=True)
+sh_x_train = theano.shared(np.asarray(train_x, dtype=theano.config.floatX), borrow=True)
+sh_x_test = theano.shared(np.asarray(test_x, dtype=theano.config.floatX), borrow=True)
 
 #dummy test data for testing the implementation
 X = np.ones((batch_size,784),dtype='float32')
@@ -286,7 +287,7 @@ for epoch in range(1,num_epochs):
 
     #shuffle train data and train model
     np.random.shuffle(train_x)
-    sh_x_train.set_value(bernoullisample(train_x))
+    sh_x_train.set_value(train_x)
     train_out = train_epoch(lr,eq_samples, iw_samples)
 
 
